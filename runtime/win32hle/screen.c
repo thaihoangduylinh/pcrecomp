@@ -902,6 +902,7 @@ int g_input_trace;                                         /* a host's --inputtr
 #define TOUCH_STICK_MS 1000                              /* a still finger this long: the stick (4 s was too long to hold still) */
 #define STICK_RADIUS 0.36f                               /* of the window's height: full speed there */
 #define STICK_DEAD 0.18f                                 /* of the radius: no scroll inside */
+#define STICK_FULL 0.6f                                  /* of the radius: from here the keys are held (full speed) */
 int (*hle_touch_stick_hook)(void);                         /* the host: may the stick come up now (a match, not a menu)? */
 static int g_touch_log = 1;                              /* [touch] lines (few: one a touch) */
 static SDL_FingerID g_t_first;
@@ -1225,8 +1226,8 @@ static void touch_event(const SDL_Event *e) {
         }
     }
 }
-/* a still finger long enough: the stick; the stick held: its keys, pulsed in
- * a 100 ms cycle for as long a share as it is pulled (each way apart) */
+/* a still finger long enough: the stick; the stick held: its arrow keys, in
+ * eight ways, pulsed below STICK_FULL (see below) */
 static void touch_poll(void) {
     uint32_t now = SDL_GetTicks();
     if (g_t_up_due && (int32_t)(now - g_t_up_due) >= 0) {
@@ -1248,11 +1249,20 @@ static void touch_poll(void) {
     g_shown_seq = ~0u;                                   /* a still picture (a menu) is drawn again, with the stick */
     float px, py;
     stick_pull(&px, &py);
-    float t = (float)((now - g_stick_phase) % 100) / 100.0f;
+    /* Eight ways, one duty for both keys: a pull near a diagonal holds both
+     * arrows together (each axis pulsed apart zig-zagged, one key on while
+     * the other was off). From STICK_FULL of the radius the keys are held
+     * (the game's own scroll rate, smooth); below it they pulse in a 40 ms
+     * cycle (100 ms stopped and went, five game frames at a time). */
+    float mag = SDL_sqrtf(px * px + py * py);
     int want = 0;
-    float ax = SDL_fabs(px), ay = SDL_fabs(py);
-    if (ax > STICK_DEAD && t < ax) want |= px < 0 ? 1 : 4;
-    if (ay > STICK_DEAD && t < ay) want |= py < 0 ? 2 : 8;
+    if (mag > STICK_DEAD) {
+        static const int dirs[8] = { 4, 4 | 8, 8, 1 | 8, 1, 1 | 2, 2, 4 | 2 };   /* from right, clockwise (y down) */
+        int sector = (int)SDL_floorf(SDL_atan2f(py, px) / 0.78539816f + 0.5f) & 7;
+        float duty = (mag - STICK_DEAD) / (STICK_FULL - STICK_DEAD);
+        float t = (float)((now - g_stick_phase) % 40) / 40.0f;
+        if (duty >= 1.0f || t < duty) want = dirs[sector];
+    }
     stick_keys(want);
 }
 /* the stick over the picture, while it is held: a ring and a knob */
