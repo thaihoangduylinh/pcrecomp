@@ -48,6 +48,13 @@ static unsigned g_shown_seq = ~0u;
 static uint32_t g_last_present;
 static int g_headless, g_fullscreen;
 static SDL_Rect g_dst;                                   /* where the picture is in the window */
+/* Pinch zoom (touch): the picture drawn g_zoom times its fitted size (g_fit),
+ * cut to g_fit, its overflow shifted by g_zpx/g_zpy (0..1). g_dst is the
+ * zoomed rectangle, so touches map to the game through it unchanged. */
+#define ZOOM_MAX 4.0f
+static SDL_Rect g_fit;
+static float g_zoom = 1.0f, g_zpx = 0.5f, g_zpy = 0.5f;
+void hle_screen_zoom_reset(void);
 /* GL mode (hle_screen_gl set before hle_screen_open): the window is made for
  * OpenGL (1) or Vulkan (2) and has no SDL renderer; a host's 3D layer (a Direct3D 8 on GL) draws
  * into it and says where its picture is (hle_screen_gl_picture), so the
@@ -415,9 +422,15 @@ static void present(int flip) {
         else if (size > 0 && w * size <= ww && h * size <= wh) g_dst.w = w * size, g_dst.h = h * size;
     }
     g_dst.x = (ww - g_dst.w) / 2, g_dst.y = (wh - g_dst.h) / 2;
+    g_fit = g_dst;
+    if (g_zoom > 1.0f) {                                 /* pinch zoom: larger, shifted, cut to the fit below */
+        int zw = (int)(g_fit.w * g_zoom), zh = (int)(g_fit.h * g_zoom);
+        g_dst.w = zw, g_dst.h = zh;
+        g_dst.x = g_fit.x - (int)((zw - g_fit.w) * g_zpx), g_dst.y = g_fit.y - (int)((zh - g_fit.h) * g_zpy);
+    }
     SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 255);
     SDL_RenderClear(g_ren);
-    if (g_bars && (g_dst.w < ww || g_dst.h < wh)) {     /* the bars: the picture, tiny then stretched, dark */
+    if (g_bars && (g_fit.w < ww || g_fit.h < wh)) {     /* the bars: the picture, tiny then stretched, dark */
         if (!g_small) g_small = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_TARGET, 24, 15);
         if (g_small) {
             SDL_SetTextureScaleMode(g_tex, SDL_ScaleModeLinear);
@@ -429,8 +442,10 @@ static void present(int flip) {
             SDL_RenderCopy(g_ren, g_small, NULL, NULL);
         }
     }
+    if (g_zoom > 1.0f) SDL_RenderSetClipRect(g_ren, &g_fit);
     int sharp = g_mode == 0 || g_mode == 2;
-    int k = g_dst.w / tw < g_dst.h / th ? g_dst.w / tw : g_dst.h / th;
+    /* the prescale from the fitted size: zoomed, it would outgrow a phone's textures */
+    int k = g_fit.w / tw < g_fit.h / th ? g_fit.w / tw : g_fit.h / th;
     if (sharp && k >= 1 && (tw * k != g_dst.w || th * k != g_dst.h)) {
         if (!g_pre || g_pre_w != tw * k || g_pre_h != th * k) {
             if (g_pre) SDL_DestroyTexture(g_pre);
@@ -477,6 +492,7 @@ static void present(int flip) {
         }
         SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
     }
+    SDL_RenderSetClipRect(g_ren, NULL);
     touch_draw();
     if (g_menu_depth) menu_draw();
     PT(3);
@@ -919,6 +935,44 @@ static float g_hk_scroll, g_hk_y0, g_hk_scroll0, g_hk_x0;   /* scroll in pixels;
 
 static float g_rad_fx, g_rad_fy;                         /* its centre, a share of the window */
 static float g_t2_x, g_t2_y;                             /* the second finger's touch-down */
+static SDL_FingerID g_t2_id;
+static float g_t2_cx, g_t2_cy;                           /* ... and where it is now */
+/* Two fingers that move (state 6): pinch zooms the picture about their
+ * middle, both moving together drag it; the point under the fingers stays
+ * under them. Lifting ends it with no right click (state 7 until all are up). */
+static float g_zg_z0, g_zg_d0, g_zg_mx0, g_zg_my0;
+static SDL_Rect g_zg_v0;
+static void zoom_begin(void) {
+    int w = 1, h = 1;
+    if (g_ren) SDL_GetRendererOutputSize(g_ren, &w, &h);
+    float dx = (g_t2_x - g_t_x0) * w, dy = (g_t2_y - g_t_y0) * h;
+    g_zg_d0 = SDL_sqrtf(dx * dx + dy * dy);
+    if (g_zg_d0 < 20.0f) g_zg_d0 = 20.0f;
+    g_zg_mx0 = (g_t_x0 + g_t2_x) / 2 * w, g_zg_my0 = (g_t_y0 + g_t2_y) / 2 * h;
+    g_zg_z0 = g_zoom, g_zg_v0 = g_dst;
+    if (g_touch_log) fprintf(stderr, "[touch] zoom from %.2f\n", g_zoom);
+}
+static void zoom_update(void) {
+    int w = 1, h = 1;
+    if (g_ren) SDL_GetRendererOutputSize(g_ren, &w, &h);
+    if (g_fit.w <= 0 || g_fit.h <= 0 || g_zg_v0.w <= 0 || g_zg_v0.h <= 0) return;
+    float dx = (g_t2_cx - g_t_x) * w, dy = (g_t2_cy - g_t_y) * h, d = SDL_sqrtf(dx * dx + dy * dy);
+    float mx = (g_t_x + g_t2_cx) / 2 * w, my = (g_t_y + g_t2_cy) / 2 * h;
+    float z = g_zg_z0 * d / g_zg_d0;
+    if (z < 1.03f) z = 1.0f;                             /* back to the original size */
+    if (z > ZOOM_MAX) z = ZOOM_MAX;
+    float ux = (g_zg_mx0 - g_zg_v0.x) / g_zg_v0.w, uy = (g_zg_my0 - g_zg_v0.y) / g_zg_v0.h;   /* the picture point under the start */
+    float zw = g_fit.w * z, zh = g_fit.h * z, vx = mx - ux * zw, vy = my - uy * zh;
+    if (vx > g_fit.x) vx = (float)g_fit.x;               /* the picture always covers the fit */
+    if (vx < g_fit.x + g_fit.w - zw) vx = g_fit.x + g_fit.w - zw;
+    if (vy > g_fit.y) vy = (float)g_fit.y;
+    if (vy < g_fit.y + g_fit.h - zh) vy = g_fit.y + g_fit.h - zh;
+    g_zoom = z;
+    g_zpx = zw > g_fit.w + 0.5f ? (g_fit.x - vx) / (zw - g_fit.w) : 0.5f;
+    g_zpy = zh > g_fit.h + 0.5f ? (g_fit.y - vy) / (zh - g_fit.h) : 0.5f;
+    g_shown_seq = ~0u;
+}
+void hle_screen_zoom_reset(void) { g_zoom = 1.0f, g_zpx = g_zpy = 0.5f; g_shown_seq = ~0u; }
 static uint32_t g_t2_since;
 static int g_t_moved;                                    /* a finger left TOUCH_SLOP (two fingers) */
 #define RADIAL_SIZE 1.0f                                 /* of the stick's radius */
@@ -1117,15 +1171,22 @@ static void touch_event(const SDL_Event *e) {
             hle_input_mouse(WM_MOUSEMOVE, g_t_gx, g_t_gy);
         } else if (g_t_state == 1) {
             g_t_state = 3;                               /* two fingers: a right click when they lift */
-            g_t2_x = f->x, g_t2_y = f->y, g_t2_since = SDL_GetTicks(), g_t_moved = 0;
+            g_t2_x = g_t2_cx = f->x, g_t2_y = g_t2_cy = f->y, g_t2_since = SDL_GetTicks(), g_t_moved = 0;
+            g_t2_id = f->fingerId;
         }
         return;
     }
     if (e->type == SDL_FINGERMOTION) {
+        if (g_t_state == 3 || g_t_state == 6) {          /* two fingers: where each is now */
+            if (f->fingerId == g_t_first) g_t_x = f->x, g_t_y = f->y;
+            else if (f->fingerId == g_t2_id) g_t2_cx = f->x, g_t2_cy = f->y;
+        }
         if (g_t_state == 3 && (f->fingerId == g_t_first ? SDL_fabs(f->x - g_t_x0) > TOUCH_SLOP || SDL_fabs(f->y - g_t_y0) > TOUCH_SLOP
                                                        : SDL_fabs(f->x - g_t2_x) > TOUCH_SLOP || SDL_fabs(f->y - g_t2_y) > TOUCH_SLOP))
             g_t_moved = 1;                               /* two fingers that move: no ring */
-        if (f->fingerId != g_t_first || g_t_state == 3 || g_t_state == 5 || g_t_state == 0) return;
+        if (g_t_state == 3 && g_t_moved && g_t_fingers >= 2) g_t_state = 6, zoom_begin();
+        if (g_t_state == 6) { zoom_update(); return; }
+        if (f->fingerId != g_t_first || g_t_state == 3 || g_t_state == 5 || g_t_state == 7 || g_t_state == 0) return;
         g_t_x = f->x, g_t_y = f->y;
         if (g_t_state == 4) return;                      /* the stick: touch_poll scrolls */
         touch_to_game(f->x, f->y, &g_t_gx, &g_t_gy);
@@ -1149,6 +1210,10 @@ static void touch_event(const SDL_Event *e) {
             g_t_state = 0;
         }
         if (g_t_fingers == 0 && g_t_state == 5) g_t_state = 0;   /* the hold opened the ring: no right click */
+        if (g_t_state == 6 && g_t_fingers < 2) {         /* the zoom ends: no right click */
+            if (g_touch_log) fprintf(stderr, "[touch] zoom %.2f\n", g_zoom);
+            g_t_state = g_t_fingers ? 7 : 0;
+        }
         if (g_t_fingers == 0 && g_t_state == 3) {
             hle_input_mouse(WM_RBUTTONDOWN, g_t_gx, g_t_gy);
             hle_input_mouse(WM_RBUTTONUP, g_t_gx, g_t_gy);

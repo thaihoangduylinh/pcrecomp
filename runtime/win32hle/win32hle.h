@@ -157,7 +157,8 @@ extern void (*hle_radial_pick_hook)(int i);
 /* screen.c: a list of hot keys over the picture (touch: drag scrolls, a tap on
  * an enabled row calls pick(i) and closes it; the close box or outside closes) */
 typedef struct { const char *key, *command, *desc; int enabled; } hle_hotkey_item_t;
-void hle_screen_hotkeys(const hle_hotkey_item_t *items, int n, void (*pick)(int i));                       /* ... and running the one tapped */
+void hle_screen_hotkeys(const hle_hotkey_item_t *items, int n, void (*pick)(int i));
+void hle_screen_zoom_reset(void);   /* screen.c: the pinch zoom back to the fitted picture */                       /* ... and running the one tapped */
 extern int (*hle_touch_stick_hook)(void);   /* screen.c: whether a held finger may bring up the camera stick */
 extern volatile int hle_in_shim_main;
 extern uint64_t hle_wait_ns[6];          /* --profile, main thread: in waits, retaking the machine, yielding it; [3] other threads holding it */
