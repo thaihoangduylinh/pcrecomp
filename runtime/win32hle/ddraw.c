@@ -488,8 +488,13 @@ static void mark(surf_t *d) {
     d->gen++;
     if (d != g_primary) return;
     g_frame_seq++;
-    if (hle_dd_primary_hook) hle_dd_primary_hook();
+    if (!hle_dd_primary_hook) return;
+    if (!hle_shim_timing) { hle_dd_primary_hook(); return; }
+    uint64_t t0 = hle_ticks();
+    hle_dd_primary_hook();
+    hle_dd_hook_ns += hle_ticks_ns(hle_ticks() - t0);
 }
+uint64_t hle_dd_hook_ns;
 
 /* The copy: same format at both ends (DirectDraw does not convert either),
  * clipped to both surfaces, stretched nearest-neighbour when the sizes

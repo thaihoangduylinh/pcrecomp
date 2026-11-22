@@ -452,7 +452,8 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
                 line = (line.replace('PUSH32(esp,', 'PUSH32_SS(esp,').replace('PUSH16(esp,', 'PUSH16_SS(esp,')
                         .replace('POP32(esp,', 'POP32_SS(esp,').replace('POP32_VAL(esp)', 'POP32_SS_VAL(esp)')
                         .replace('POP16_VAL(esp)', 'POP16_SS_VAL(esp)')
-                        .replace('RECOMP_CALL(', 'RECOMP_CALL_SS(').replace('RECOMP_ICALL(', 'RECOMP_ICALL_SS('))
+                        .replace('RECOMP_CALL(', 'RECOMP_CALL_SS(').replace('RECOMP_ICALL(', 'RECOMP_ICALL_SS(')
+                        .replace('RECOMP_CALL_NF(', 'RECOMP_CALL_NF_SS(').replace('RECOMP_ICALL_NF(', 'RECOMP_ICALL_NF_SS('))
             lines.append(f'    {line}')
         if k in gaps:
             t = gaps[k]

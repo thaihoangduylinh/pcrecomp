@@ -134,15 +134,24 @@ static void k_CreateFileA(void) {
     case 5: fl |= O_TRUNC; break;
     default: break;
     }
-    struct stat st;
-    if (exists && stat(path, &st) == 0 && S_ISDIR(st.st_mode) && !(A32(5) & 0x02000000u)) {
-        hle_set_last_error(ERROR_ACCESS_DENIED);    /* a directory, without FILE_FLAG_BACKUP_SEMANTICS */
+    /* Not there and not to be made: the kept listings (hle_path.c) already
+     * said so, and a failing open costs ~0.2 ms on a phone. Games probe for
+     * loose files before their archives many times a second (RA2: *.URB). */
+    if (!exists && !(fl & O_CREAT)) {
+        if (hle_filetrace()) fprintf(stderr, "[file] CreateFileA \"%s\" -> %s not found\n", name, path);
+        hle_set_last_error(ERROR_FILE_NOT_FOUND);
         RET(INVALID_HANDLE, 7);
     }
     int fd = open(path, fl | O_CLOEXEC, 0644);
     if (hle_filetrace())
         fprintf(stderr, "[file] CreateFileA \"%s\" -> %s %s\n", name, path, fd >= 0 ? "ok" : strerror(errno));
     if (fd < 0) { hle_set_last_error(errno_to_win(errno)); RET(INVALID_HANDLE, 7); }
+    struct stat st;                                 /* on the open file: no second lookup by name */
+    if (exists && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) && !(A32(5) & 0x02000000u)) {
+        close(fd);
+        hle_set_last_error(ERROR_ACCESS_DENIED);    /* a directory, without FILE_FLAG_BACKUP_SEMANTICS */
+        RET(INVALID_HANDLE, 7);
+    }
     if ((fl & O_CREAT) && !exists) hle_path_changed();
     hle_set_last_error(exists && (disp == 2 || disp == 4) ? ERROR_ALREADY_EXISTS : 0);
     RET(new_file(fd), 7);

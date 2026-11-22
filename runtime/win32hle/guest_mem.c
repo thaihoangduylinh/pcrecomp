@@ -6,7 +6,9 @@
  * Flat (HLE_FLAT: any 32-bit host): a VA is a host address, so pages
  * are mmaps where the guest asks for them and the heap is malloc.
  *
- * Based (a 64-bit host): the guest's 4 GB is one mapping at g_mem_base, and
+ * Based (a 64-bit host, or a 32-bit one with HLE_BASED: then the block is
+ * the first hle_span bytes of the space, not all 4 GB): the guest's 4 GB is
+ * one mapping at g_mem_base, and
  * nothing outside it has a VA. Pages are ranges of that mapping, tracked here
  * and left inaccessible until reserved, as on Windows; the heap is size
  * classes carved from reservations. Host pages may be larger than the guest's
@@ -139,9 +141,24 @@ void *hle_heap_realloc(void *u, uint32_t n, int zero) {
 #else
 /* =============================================================== based */
 
+#if UINTPTR_MAX == 0xFFFFFFFFu
+/* A 32-bit host: as much of the guest's space as one block of its own can
+ * hold, tried from HLE_SPAN_MAX down to HLE_SPAN_MIN. The images sit below
+ * ANY_LO; "anywhere" (heaps, stacks, DLLs) is above it, up to the span. */
+#ifndef HLE_SPAN_MAX
+#define HLE_SPAN_MAX 0x40000000u       /* 1 GB */
+#endif
+#ifndef HLE_SPAN_MIN
+#define HLE_SPAN_MIN 0x18000000u       /* 384 MB */
+#endif
+uint32_t hle_span;
+#define SPAN      ((uint64_t)hle_span)
+#define ANY_HI    (hle_vm_any_hi < hle_span ? hle_vm_any_hi : hle_span)
+#else
 #define SPAN      0x100000000ull       /* the guest's whole 32-bit space */
-#define ANY_LO    0x10000000u          /* "anywhere" starts above the images */
 #define ANY_HI    hle_vm_any_hi        /* under GetSystemInfo's highest application address */
+#endif
+#define ANY_LO    0x10000000u          /* "anywhere" starts above the images */
 #define SHIM_LO   0x7F000000u          /* host_lite.c's synthetic import VAs: never mapped */
 #define SHIM_HI   0x80000000u
 #define MAX_RANGES 8192
@@ -166,12 +183,23 @@ static void mem_init_once(void) {
      * mapped is replaced (Linux says so with NOREPLACE; macOS honours a free
      * hint). */
     void *want = (void *)(uintptr_t)(RECOMP_MEM_BASE);
+#if UINTPTR_MAX == 0xFFFFFFFFu
+    hle_span = HLE_SPAN_MAX;
+#endif
     void *p = mmap(want, SPAN, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 #ifdef __linux__
                    | MAP_FIXED_NOREPLACE
 #endif
                    , -1, 0);
     if (p != want) hle_fatal("cannot reserve the guest's 4 GB at %p (RECOMP_MEM_BASE): the range is in use", want);
+#elif UINTPTR_MAX == 0xFFFFFFFFu
+    void *p = MAP_FAILED;
+    for (uint32_t n = HLE_SPAN_MAX; p == MAP_FAILED && n >= HLE_SPAN_MIN; n -= 0x04000000u) {
+        p = mmap(NULL, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p != MAP_FAILED) hle_span = n;
+    }
+    if (p == MAP_FAILED) hle_fatal("cannot reserve %u MB for the guest", (unsigned)(HLE_SPAN_MIN >> 20));
+    fprintf(stderr, "[win32hle] guest memory: %u MB at %p\n", (unsigned)(hle_span >> 20), p);
 #else
     void *p = mmap(NULL, SPAN, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) hle_fatal("cannot reserve the guest's 4 GB");
@@ -496,7 +524,7 @@ uint32_t hle_guest_str_or_atom(const char *s) {
     if ((uintptr_t)s < 0x10000u) return (uint32_t)(uintptr_t)s;
 #ifndef HLE_FLAT
     uintptr_t off = (uintptr_t)s - (uintptr_t)g_mem_base;
-    if ((uint64_t)off >> 32) return hle_scratch_copy(s, (uint32_t)strlen(s) + 1);
+    if (HLE_OFF_BAD(off)) return hle_scratch_copy(s, (uint32_t)strlen(s) + 1);
 #endif
     return hle_va(s);
 }

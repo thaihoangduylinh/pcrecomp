@@ -330,6 +330,16 @@ class Lifter:
         self._jump_targets = None  # arms its switch tables dispatch to
         self._flag_state = None  # (setter_mnemonic, operands_str)
         self._flag_seq = 0       # bumped whenever the flags are written
+        # Flags across calls and returns (flagflow.py; None/True: always, as
+        # before). flags_in: the functions whose entry reads the caller's
+        # flags (a call to any other skips storing them, RECOMP_CALL_NF);
+        # flags_out: whether this function's callers read its flags after it
+        # returns (no: its `ret` skips storing them); icall_nf: an indirect
+        # call skips storing them (no indirect callee reads them). Imports
+        # never read guest flags: with flags_in set, their calls skip it too.
+        self.flags_in = None
+        self.flags_out = True
+        self.icall_nf = False
         self._fp_depth = 0  # FPU stack depth tracking
 
     def _branch_to(self, target: int) -> str:
@@ -1595,16 +1605,17 @@ class Lifter:
             target = insn.get_branch_target()
             if target:
                 # Check IAT (import)
+                nf = '_NF' if self.flags_in is not None and target not in self.flags_in else ''
                 if target in self.iat_map:
                     dll, fname = self.iat_map[target]
                     lines.append(f"/* call [{dll}]{fname} */")
-                    lines.append(f"RECOMP_ICALL(0x{target:08X}u); {comment}")
+                    lines.append(f"RECOMP_ICALL{nf}(0x{target:08X}u); {comment}")
                 elif target in self.func_names:
-                    lines.append(f"RECOMP_CALL(recomp_{self.func_names[target]}); {comment}")
+                    lines.append(f"RECOMP_CALL{nf}(recomp_{self.func_names[target]}); {comment}")
                 elif self.lifted is not None and target not in self.lifted:
                     lines.append(f"RECOMP_ICALL(0x{target:08X}u); {comment} /* not lifted */")
                 else:
-                    lines.append(f"RECOMP_CALL(sub_{target:08X}); {comment}")
+                    lines.append(f"RECOMP_CALL{nf}(sub_{target:08X}); {comment}")
             else:
                 # Indirect call
                 if ops and ops[0].type == X86_OP_MEM and self.dos and _is_far_indirect(insn):
@@ -1633,10 +1644,15 @@ class Lifter:
                                  f" if (_gr != 0x{nxt:08X}u) return; }} else RECOMP_REGS_IN(); }} {comment}")
                 elif ops and ops[0].type == X86_OP_MEM:
                     addr = self._fmt_mem_addr(ops[0].mem)
-                    lines.append(f"RECOMP_ICALL(MEM32({addr})); {comment}")
+                    m0 = ops[0].mem
+                    imp = (self.flags_in is not None and m0.base == 0 and m0.index == 0
+                           and (m0.disp & 0xFFFFFFFF) in self.iat_map)   # call [IAT]: an import
+                    nf = '_NF' if self.icall_nf or imp else ''
+                    lines.append(f"RECOMP_ICALL{nf}(MEM32({addr})); {comment}")
                 elif ops and ops[0].type == X86_OP_REG:
                     r = self._fmt_read(ops[0])
-                    lines.append(f"RECOMP_ICALL({r}); {comment}")
+                    nf = '_NF' if self.icall_nf else ''
+                    lines.append(f"RECOMP_ICALL{nf}({r}); {comment}")
                 else:
                     lines.append(f"RECOMP_ICALL(0); /* unresolved */ {comment}")
             # the callee's flags (see RECOMP_FLAGS_OUT)
@@ -1663,9 +1679,11 @@ class Lifter:
                              f" RECOMP_RET_JUMP(_rt); return; }} /* push; ret: a jump */ {comment}")
             elif ops and ops[0].type == X86_OP_IMM:
                 n = ops[0].imm
-                lines.append(f"RECOMP_FLAGS_OUT(); esp += {4 + n}; return; {comment}")
+                out = 'RECOMP_FLAGS_OUT(); ' if self.flags_out else ''
+                lines.append(f"{out}esp += {4 + n}; return; {comment}")
             else:
-                lines.append(f"RECOMP_FLAGS_OUT(); esp += 4; return; {comment}")
+                out = 'RECOMP_FLAGS_OUT(); ' if self.flags_out else ''
+                lines.append(f"{out}esp += 4; return; {comment}")
 
         elif m == 'retf':
             if self.dos:

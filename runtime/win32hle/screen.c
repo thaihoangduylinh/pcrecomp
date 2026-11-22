@@ -276,6 +276,23 @@ static void pace(void) {
     last_call = now;
     g_pace_k = k, g_pace_hz = hz;
 }
+/* The least time between two presents of a game that does not flip (ms):
+ * HLE_PRESENT_MS, 15 by default (about 60 a second). A slow device spends
+ * the present's time off the game's logic, so fewer presents run it faster. */
+static uint32_t present_ms(void) {
+    static int ms = -1;
+    if (ms < 0) { const char *e = SDL_getenv("HLE_PRESENT_MS"); ms = e && atoi(e) > 0 ? atoi(e) : 15; }
+    return (uint32_t)ms;
+}
+static void touch_draw(void);
+/* The present's parts, timed while hle_shim_timing (--profile): 0 the frame
+ * hook, 1 overlay/compose, 2 texture upload, 3 draw, 4 RenderPresent,
+ * 5 PumpEvents. hle_present_n[0] counts presents, [5] event pumps. */
+uint64_t hle_present_ns[8];
+uint32_t hle_present_n[8];
+static uint64_t g_pt;
+#define PT_START() do { if (hle_shim_timing) g_pt = hle_ticks(); } while (0)
+#define PT(k) do { if (hle_shim_timing) { uint64_t t_ = hle_ticks(); hle_present_ns[k] += hle_ticks_ns(t_ - g_pt); g_pt = t_; } } while (0)
 /* flip: the game flipped, and this frame is shown, paced (pace). */
 static void present(int flip) {
     const uint8_t *px;
@@ -287,8 +304,10 @@ static void present(int flip) {
     uint32_t now = hle_ticks_ms();
     g_src_w = w, g_src_h = h;
     if (!flip && seq == g_shown_seq && now - g_last_present < 250) return;
-    if (!flip && now - g_last_present < 15) return;
+    if (!flip && now - g_last_present < present_ms()) return;
     g_shown_seq = seq, g_last_present = now;
+    PT_START();
+    hle_present_n[0]++;
     if (hle_screen_frame_hook) hle_screen_frame_hook(px, w, h, pitch, bpp);
     if (!g_ren) return;
 #ifdef __EMSCRIPTEN__
@@ -332,6 +351,7 @@ static void present(int flip) {
         }
     }
 #endif
+    PT(0);
     int hd = 0, ov = 0, ovx = 0, ovy = 0, ovw = 0, ovh = 0;
     if (bpp == 16 && hle_screen_overlay_hook) {        /* 1x base scaled on the GPU + an Nx overlay */
         if (g_ov_n < (size_t)w * h * 9) {              /* sized for the largest scale (3x) */
@@ -344,12 +364,21 @@ static void present(int flip) {
         if (g_hd_n < (size_t)w * h * 4) { free(g_hd); g_hd_n = (size_t)w * h * 4; g_hd = (uint32_t *)malloc(g_hd_n * 4); }
         hd = g_hd && hle_screen_compose_hook(px, pitch, w, h, g_hd);
     }
+    PT(1);
     int fmt = bpp == 16 && !hd ? SDL_PIXELFORMAT_RGB565 : SDL_PIXELFORMAT_RGB888;
     int tw = hd ? 2 * w : w, th = hd ? 2 * h : h;
     if (!g_tex || g_tex_w != tw || g_tex_h != th || g_tex_fmt != fmt) {
         if (g_tex) SDL_DestroyTexture(g_tex);
         g_tex = SDL_CreateTexture(g_ren, (Uint32)fmt, SDL_TEXTUREACCESS_STREAMING, tw, th);
         g_tex_w = tw, g_tex_h = th, g_tex_fmt = fmt;
+        {   /* the format the renderer really keeps: another one costs a CPU conversion each frame */
+            SDL_RendererInfo ri;
+            int native = 0;
+            if (SDL_GetRendererInfo(g_ren, &ri) == 0)
+                for (Uint32 i = 0; i < ri.num_texture_formats; i++) native |= ri.texture_formats[i] == (Uint32)fmt;
+            fprintf(stderr, "[screen] frame texture %dx%d %s%s\n", tw, th, SDL_GetPixelFormatName((Uint32)fmt),
+                    !native ? " (not native: SDL converts it)" : "");
+        }
     }
     if (hd) {
         SDL_UpdateTexture(g_tex, NULL, g_hd, tw * 4);
@@ -364,6 +393,7 @@ static void present(int flip) {
     } else {
         SDL_UpdateTexture(g_tex, NULL, px, pitch);
     }
+    PT(2);
     int ww, wh;
     SDL_GetRendererOutputSize(g_ren, &ww, &wh);
     if ((long long)ww * h > (long long)wh * w) g_dst.h = wh, g_dst.w = (int)((long long)wh * w / h);
@@ -372,6 +402,17 @@ static void present(int flip) {
         int k = ww / w < wh / h ? ww / w : wh / h;
         if (k < 1) k = 1;
         g_dst.w = w * k, g_dst.h = h * k;
+    }
+    {   /* HLE_SIZE: "stretch" fills the window (the shape lost); "1".."4" that
+         * many times the game's size, or the fit when it would not fit; else
+         * (unset, "fit") the fit above. The filter (g_mode) stays apart. */
+        static int size = -2;                            /* -1 stretch, 0 fit, N times */
+        if (size == -2) {
+            const char *e = SDL_getenv("HLE_SIZE");
+            size = !e ? 0 : !strcmp(e, "stretch") ? -1 : atoi(e) > 0 && atoi(e) <= 8 ? atoi(e) : 0;
+        }
+        if (size < 0) g_dst.w = ww, g_dst.h = wh;
+        else if (size > 0 && w * size <= ww && h * size <= wh) g_dst.w = w * size, g_dst.h = h * size;
     }
     g_dst.x = (ww - g_dst.w) / 2, g_dst.y = (wh - g_dst.h) / 2;
     SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 255);
@@ -436,9 +477,12 @@ static void present(int flip) {
         }
         SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
     }
+    touch_draw();
     if (g_menu_depth) menu_draw();
+    PT(3);
     if (flip) pace();
     SDL_RenderPresent(g_ren);
+    PT(4);
     if (flip) g_paced_back = SDL_GetPerformanceCounter();
     static int trace = -1;
     static uint32_t t0, prev, shown, flips, worst, late;
@@ -827,6 +871,541 @@ static void confine_update(void) {
 #include <emscripten/threading.h>
 #endif
 int g_input_trace;                                         /* a host's --inputtrace */
+/* Touch, for a game made for a mouse (a phone). SDL's own touch-to-mouse is
+ * off (hle_screen_open); here one finger is the left button, two the right:
+ *  - one finger: the cursor goes to it; nothing is pressed while it stays
+ *    still. A move past TOUCH_SLOP presses the left button and drags (a
+ *    selection box) until the lift; a lift before any move is a left click;
+ *  - a second finger while the first still waits: no left press at all, and
+ *    when the last finger lifts, a right click where the first was;
+ *  - one finger held still TOUCH_STICK_MS: an analog stick comes up under it
+ *    and the camera follows the finger's pull (the arrow keys, pulsed by how
+ *    far: farther is faster) until the lift. A map scrolls at its edges for
+ *    a mouse, which a finger can hardly reach. */
+#define TOUCH_SLOP 0.035f                                /* of the window's size */
+#define TOUCH_STICK_MS 1000                              /* a still finger this long: the stick (4 s was too long to hold still) */
+#define STICK_RADIUS 0.36f                               /* of the window's height: full speed there */
+#define STICK_DEAD 0.18f                                 /* of the radius: no scroll inside */
+int (*hle_touch_stick_hook)(void);                         /* the host: may the stick come up now (a match, not a menu)? */
+static int g_touch_log = 1;                              /* [touch] lines (few: one a touch) */
+static SDL_FingerID g_t_first;
+static int g_t_fingers, g_t_state;                       /* 0 none, 1 waiting, 2 left held, 3 right (two fingers), 4 stick */
+static uint32_t g_t_since;
+static float g_t_x0, g_t_y0, g_t_x, g_t_y;
+static int g_t_gx, g_t_gy;
+static uint32_t g_t_up_due;                              /* a tap's left button goes up then (0: none) */
+#define TOUCH_TAP_HOLD_MS 80                             /* a menu polls its buttons by frame: down and up at once was missed */
+static int g_stick_keys;                                 /* arrow keys held: 1 left, 2 up, 4 right, 8 down */
+/* The ring menu: two fingers held still TOUCH_STICK_MS bring up, between
+ * them, a ring the stick's size with the host's commands around it
+ * (hle_radial_items_hook: a label and its key, as text). It stays up after
+ * the lift; a tap on a command runs it (hle_radial_pick_hook: the host sends
+ * its keys), a tap anywhere else only closes it. */
+#define RADIAL_MAX 16
+const hle_ring_item_t *(*hle_radial_items_hook)(int *n);
+void (*hle_radial_pick_hook)(int i);
+static int g_rad_open, g_rad_arming, g_rad_n, g_rad_hit = -1;
+static const hle_ring_item_t *g_rad_items;
+
+/* The hot key list (hle_screen_hotkeys): a panel over the picture, a title
+ * and a close box on top, then one row a key (key, command, description),
+ * dragged to scroll. A tap on a row runs it (the host's pick: its key) and
+ * closes the list; a row that is not enabled (a key with a mouse click, a
+ * key held) only shows. A tap on the close box or outside closes it. */
+static const hle_hotkey_item_t *g_hk_items;
+static int g_hk_n, g_hk_open, g_hk_down, g_hk_moved, g_hk_row = -1;
+static void (*g_hk_pick)(int i);
+static float g_hk_scroll, g_hk_y0, g_hk_scroll0, g_hk_x0;   /* scroll in pixels; the touch-down */
+
+static float g_rad_fx, g_rad_fy;                         /* its centre, a share of the window */
+static float g_t2_x, g_t2_y;                             /* the second finger's touch-down */
+static uint32_t g_t2_since;
+static int g_t_moved;                                    /* a finger left TOUCH_SLOP (two fingers) */
+#define RADIAL_SIZE 1.0f                                 /* of the stick's radius */
+static uint32_t g_stick_phase;
+static void touch_to_game(float fx, float fy, int *gx, int *gy) {
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(g_win, &ww, &wh);
+    to_game((int)(fx * ww), (int)(fy * wh), gx, gy);
+}
+static void touch_press_left(void) {
+    hle_input_mouse(WM_LBUTTONDOWN, g_t_gx, g_t_gy);
+    g_t_state = 2;
+}
+static void stick_keys(int want) {
+    static const struct { int bit; uint32_t vk, scan; } k[4] = {
+        { 1, 0x25, 75 }, { 2, 0x26, 72 }, { 4, 0x27, 77 }, { 8, 0x28, 80 } };   /* scan codes as scan_of gives them */
+    for (int i = 0; i < 4; i++)
+        if ((want ^ g_stick_keys) & k[i].bit) hle_input_key((want & k[i].bit) != 0, k[i].vk, k[i].scan);
+    g_stick_keys = want;
+}
+/* the stick's pull, -1..1 each way, as a share of its radius (window frame: x scaled to y) */
+static void stick_pull(float *px, float *py) {
+    int ww = 1, wh = 1;
+    SDL_GetWindowSize(g_win, &ww, &wh);
+    float dx = (g_t_x - g_t_x0) * (float)ww / (float)(wh > 0 ? wh : 1), dy = g_t_y - g_t_y0;
+    float d = SDL_sqrtf(dx * dx + dy * dy), r = STICK_RADIUS;
+    if (d > r) dx *= r / d, dy *= r / d;
+    *px = dx / r, *py = dy / r;
+}
+/* the ring's geometry in renderer pixels: centre, radius, item ring, item radius */
+static void radial_geom(int *cx, int *cy, int *r, int *rr, int *ir) {
+    int w = 1, h = 1;
+    if (g_ren) SDL_GetRendererOutputSize(g_ren, &w, &h);
+    int R = (int)(STICK_RADIUS * RADIAL_SIZE * h);
+    int x = (int)(g_rad_fx * w), y = (int)(g_rad_fy * h);
+    if (x < R) x = R;                                    /* the whole ring on the screen */
+    if (x > w - R) x = w - R;
+    if (y < R) y = R;
+    if (y > h - R) y = h - R;
+    int ring = R * 60 / 100, it = R * 36 / 100;
+    if (g_rad_n > 0) {                                   /* items no wider than their share of the circle */
+        int fit = (int)(3.14159f * ring / g_rad_n * 0.9f);
+        if (fit < it) it = fit;
+    }
+    *cx = x, *cy = y, *r = R, *rr = ring, *ir = it;
+}
+static void radial_item_at(int i, int *x, int *y) {
+    int cx, cy, r, rr, ir;
+    radial_geom(&cx, &cy, &r, &rr, &ir);
+    float a = -1.5707963f + 6.2831853f * (float)i / (float)(g_rad_n > 0 ? g_rad_n : 1);   /* from the top, clockwise */
+    *x = cx + (int)(rr * SDL_cosf(a)), *y = cy + (int)(rr * SDL_sinf(a));
+}
+/* which item a touch (a share of the window) is on: its index, -1 none */
+static int radial_hit(float fx, float fy) {
+    int w = 1, h = 1, cx, cy, r, rr, ir;
+    if (g_ren) SDL_GetRendererOutputSize(g_ren, &w, &h);
+    radial_geom(&cx, &cy, &r, &rr, &ir);
+    int px = (int)(fx * w), py = (int)(fy * h), best = -1;
+    long long bd = 0, lim = (long long)(ir * 13 / 10) * (ir * 13 / 10);   /* a little past the drawn circle */
+    for (int i = 0; i < g_rad_n; i++) {
+        int x, y;
+        radial_item_at(i, &x, &y);
+        long long d = (long long)(px - x) * (px - x) + (long long)(py - y) * (py - y);
+        if (d <= lim && (best < 0 || d < bd)) best = i, bd = d;
+    }
+    return best;
+}
+static void radial_open(float fx, float fy) {
+    int n = 0;
+    const hle_ring_item_t *it = hle_radial_items_hook ? hle_radial_items_hook(&n) : NULL;
+    if (!it || n <= 0) { if (g_touch_log) fprintf(stderr, "[touch] ring: no commands\n"); return; }
+    if (n > RADIAL_MAX) n = RADIAL_MAX;
+    g_rad_items = it, g_rad_n = n, g_rad_open = 1, g_rad_arming = 1, g_rad_hit = -1, g_rad_fx = fx, g_rad_fy = fy;
+    if (g_touch_log) fprintf(stderr, "[touch] ring on: %d commands\n", n);
+    g_shown_seq = ~0u;
+}
+static void radial_close(void) { g_rad_open = 0, g_rad_hit = -1; g_shown_seq = ~0u; }
+static void radial_click(int i) {
+    if (g_touch_log) fprintf(stderr, "[touch] ring: %s (%s)\n", g_rad_items[i].label ? g_rad_items[i].label : "", g_rad_items[i].key ? g_rad_items[i].key : "");
+    if (hle_radial_pick_hook) hle_radial_pick_hook(i);
+}
+/* the list's panel, title bar and close box, rows' height, in renderer pixels */
+static void hk_geom(SDL_Rect *panel, SDL_Rect *close, int *title_h, int *row_h) {
+    int w = 1, h = 1;
+    if (g_ren) SDL_GetRendererOutputSize(g_ren, &w, &h);
+    int pw = w * 86 / 100, ph = h * 90 / 100;
+    *panel = (SDL_Rect){ (w - pw) / 2, (h - ph) / 2, pw, ph };
+    *title_h = h / 9, *row_h = h / 8;
+    int cs = *title_h * 80 / 100;
+    *close = (SDL_Rect){ panel->x + pw - cs - *title_h / 10, panel->y + (*title_h - cs) / 2, cs, cs };
+}
+static float hk_max_scroll(void) {
+    SDL_Rect pa, cl; int th, rh;
+    hk_geom(&pa, &cl, &th, &rh);
+    float m = (float)(g_hk_n * rh - (pa.h - th));
+    return m > 0 ? m : 0;
+}
+/* the row under a point (renderer pixels): its index, -1 none */
+static int hk_row_at(int x, int y) {
+    SDL_Rect pa, cl; int th, rh;
+    hk_geom(&pa, &cl, &th, &rh);
+    if (x < pa.x || x >= pa.x + pa.w || y < pa.y + th || y >= pa.y + pa.h) return -1;
+    int i = (int)((y - pa.y - th + g_hk_scroll) / rh);
+    return i >= 0 && i < g_hk_n ? i : -1;
+}
+void hle_screen_hotkeys(const hle_hotkey_item_t *items, int n, void (*pick)(int i)) {
+    if (!items || n <= 0) return;
+    g_hk_items = items, g_hk_n = n, g_hk_pick = pick, g_hk_open = 1, g_hk_down = 0, g_hk_row = -1, g_hk_scroll = 0;
+    if (g_touch_log) fprintf(stderr, "[touch] hot keys: %d rows\n", n);
+    g_shown_seq = ~0u;
+}
+static void hk_close(void) { g_hk_open = 0, g_hk_down = 0, g_hk_row = -1; g_shown_seq = ~0u; }
+/* a touch on the list: drag scrolls, a tap runs a row or closes */
+static void hk_touch(const SDL_Event *e) {
+    const SDL_TouchFingerEvent *f = &e->tfinger;
+    int w = 1, h = 1;
+    if (g_ren) SDL_GetRendererOutputSize(g_ren, &w, &h);
+    int x = (int)(f->x * w), y = (int)(f->y * h);
+    g_t_fingers = e->type == SDL_FINGERMOTION ? g_t_fingers : SDL_GetNumTouchFingers(f->touchId);
+    if (e->type == SDL_FINGERDOWN) {
+        if (g_hk_down) return;                           /* one finger drives it */
+        g_t_first = f->fingerId, g_hk_down = 1, g_hk_moved = 0;
+        g_hk_x0 = f->x, g_hk_y0 = f->y, g_hk_scroll0 = g_hk_scroll;
+        g_hk_row = hk_row_at(x, y);
+        g_shown_seq = ~0u;
+        return;
+    }
+    if (f->fingerId != g_t_first || !g_hk_down) return;
+    if (e->type == SDL_FINGERMOTION) {
+        if (SDL_fabs(f->y - g_hk_y0) > TOUCH_SLOP || SDL_fabs(f->x - g_hk_x0) > TOUCH_SLOP) g_hk_moved = 1, g_hk_row = -1;
+        if (g_hk_moved) {
+            float sc = g_hk_scroll0 - (f->y - g_hk_y0) * h, m = hk_max_scroll();
+            g_hk_scroll = sc < 0 ? 0 : sc > m ? m : sc;
+        }
+        g_shown_seq = ~0u;
+        return;
+    }
+    if (e->type == SDL_FINGERUP) {
+        g_hk_down = 0;
+        if (g_hk_moved) { g_hk_row = -1; g_shown_seq = ~0u; return; }
+        SDL_Rect pa, cl; int th, rh;
+        hk_geom(&pa, &cl, &th, &rh);
+        int in_close = x >= cl.x - cl.w / 2 && x < cl.x + cl.w + cl.w / 2 && y >= cl.y - cl.h / 2 && y < cl.y + cl.h + cl.h / 2;
+        int out = x < pa.x || x >= pa.x + pa.w || y < pa.y || y >= pa.y + pa.h;
+        int row = hk_row_at(x, y), was = g_hk_row;
+        if (g_touch_log) fprintf(stderr, "[touch] hot keys tap at %d,%d: row %d%s%s\n", x, y, row, in_close ? " (close)" : "", out ? " (outside)" : "");
+        if (in_close || out) { hk_close(); return; }
+        if (row >= 0 && row == was && g_hk_items[row].enabled) {
+            hk_close();
+            if (g_touch_log) fprintf(stderr, "[touch] hot key: %s (%s)\n", g_hk_items[row].command, g_hk_items[row].key);
+            if (g_hk_pick) g_hk_pick(row);
+            return;
+        }
+        g_hk_row = -1;
+        g_shown_seq = ~0u;
+    }
+}
+static void touch_event(const SDL_Event *e) {
+    const SDL_TouchFingerEvent *rf = &e->tfinger;
+    if (g_hk_open) { hk_touch(e); g_t_state = 0; return; }
+    if (g_rad_open) {                                    /* the ring is up: a tap picks or closes, nothing reaches the game */
+        if (g_rad_arming) {                              /* the fingers that opened it: wait for them all to lift */
+            if (e->type != SDL_FINGERMOTION) g_t_fingers = SDL_GetNumTouchFingers(rf->touchId);
+            if (e->type == SDL_FINGERUP && g_t_fingers == 0) {
+                g_rad_arming = 0;
+                if (g_touch_log) fprintf(stderr, "[touch] ring: fingers up, waiting for a tap\n");
+            }
+            g_t_state = 0;
+            return;
+        }
+        if (e->type == SDL_FINGERDOWN) {
+            g_t_fingers = SDL_GetNumTouchFingers(rf->touchId);
+            if (g_t_fingers <= 1) g_t_first = rf->fingerId, g_rad_hit = radial_hit(rf->x, rf->y);
+            else g_rad_hit = -2;                         /* more fingers: not a tap */
+        } else if (e->type == SDL_FINGERUP) {
+            g_t_fingers = SDL_GetNumTouchFingers(rf->touchId);
+            if (rf->fingerId == g_t_first && g_rad_hit != -2) {
+                int at = radial_hit(rf->x, rf->y), hit = g_rad_hit;
+                if (g_touch_log) fprintf(stderr, "[touch] ring tap at %.3f,%.3f: item %d (down on %d)\n", rf->x, rf->y, at, hit);
+                radial_close();
+                if (at >= 0 && (at == hit || hit == -1)) radial_click(at);   /* down just outside a circle, up on it: still that one */
+            } else if (g_t_fingers == 0) radial_close();
+        }
+        g_t_state = 0;
+        return;
+    }
+    const SDL_TouchFingerEvent *f = &e->tfinger;
+    if (e->type == SDL_FINGERDOWN) {
+        if (g_touch_log) fprintf(stderr, "[touch] down %d at %.3f,%.3f (state %d)\n", g_t_fingers + 1, f->x, f->y, g_t_state);
+        g_t_fingers = SDL_GetNumTouchFingers(f->touchId);   /* SDL's count: a missed lift once left ours stuck */
+        if (g_t_up_due) hle_input_mouse(WM_LBUTTONUP, g_t_gx, g_t_gy), g_t_up_due = 0;
+        if (g_t_fingers <= 1 || g_t_state == 0) {
+            g_t_first = f->fingerId, g_t_state = 1, g_t_since = SDL_GetTicks();
+            g_t_x0 = g_t_x = f->x, g_t_y0 = g_t_y = f->y;
+            touch_to_game(f->x, f->y, &g_t_gx, &g_t_gy);
+            hle_input_mouse(WM_MOUSEMOVE, g_t_gx, g_t_gy);
+        } else if (g_t_state == 1) {
+            g_t_state = 3;                               /* two fingers: a right click when they lift */
+            g_t2_x = f->x, g_t2_y = f->y, g_t2_since = SDL_GetTicks(), g_t_moved = 0;
+        }
+        return;
+    }
+    if (e->type == SDL_FINGERMOTION) {
+        if (g_t_state == 3 && (f->fingerId == g_t_first ? SDL_fabs(f->x - g_t_x0) > TOUCH_SLOP || SDL_fabs(f->y - g_t_y0) > TOUCH_SLOP
+                                                       : SDL_fabs(f->x - g_t2_x) > TOUCH_SLOP || SDL_fabs(f->y - g_t2_y) > TOUCH_SLOP))
+            g_t_moved = 1;                               /* two fingers that move: no ring */
+        if (f->fingerId != g_t_first || g_t_state == 3 || g_t_state == 5 || g_t_state == 0) return;
+        g_t_x = f->x, g_t_y = f->y;
+        if (g_t_state == 4) return;                      /* the stick: touch_poll scrolls */
+        touch_to_game(f->x, f->y, &g_t_gx, &g_t_gy);
+        if (g_t_state == 1 && (SDL_fabs(f->x - g_t_x0) > TOUCH_SLOP || SDL_fabs(f->y - g_t_y0) > TOUCH_SLOP)) {
+            if (g_touch_log) fprintf(stderr, "[touch] drag after %u ms\n", SDL_GetTicks() - g_t_since);
+            touch_press_left();
+        }
+        hle_input_mouse(WM_MOUSEMOVE, g_t_gx, g_t_gy);
+        return;
+    }
+    if (e->type == SDL_FINGERUP) {
+        if (g_touch_log) fprintf(stderr, "[touch] up (state %d, %u ms)\n", g_t_state, SDL_GetTicks() - g_t_since);
+        g_t_fingers = SDL_GetNumTouchFingers(f->touchId);
+        if (f->fingerId == g_t_first && g_t_state != 3) {
+            if (g_t_state == 1) {                        /* a tap: down now, up a little later (touch_poll) */
+                touch_press_left();
+                g_t_up_due = SDL_GetTicks() + TOUCH_TAP_HOLD_MS;
+                if (!g_t_up_due) g_t_up_due = 1;
+            } else if (g_t_state == 2) hle_input_mouse(WM_LBUTTONUP, g_t_gx, g_t_gy);
+            if (g_t_state == 4) stick_keys(0), g_shown_seq = ~0u;
+            g_t_state = 0;
+        }
+        if (g_t_fingers == 0 && g_t_state == 5) g_t_state = 0;   /* the hold opened the ring: no right click */
+        if (g_t_fingers == 0 && g_t_state == 3) {
+            hle_input_mouse(WM_RBUTTONDOWN, g_t_gx, g_t_gy);
+            hle_input_mouse(WM_RBUTTONUP, g_t_gx, g_t_gy);
+            g_t_state = 0;
+        }
+        if (g_t_fingers == 0) {
+            if (g_t_state == 4) stick_keys(0);
+            g_t_state = 0;
+        }
+    }
+}
+/* a still finger long enough: the stick; the stick held: its keys, pulsed in
+ * a 100 ms cycle for as long a share as it is pulled (each way apart) */
+static void touch_poll(void) {
+    uint32_t now = SDL_GetTicks();
+    if (g_t_up_due && (int32_t)(now - g_t_up_due) >= 0) {
+        hle_input_mouse(WM_LBUTTONUP, g_t_gx, g_t_gy);
+        g_t_up_due = 0;
+    }
+    if (g_t_state == 1 && now - g_t_since >= TOUCH_STICK_MS && (!hle_touch_stick_hook || hle_touch_stick_hook())) {
+        g_t_state = 4, g_stick_phase = now;
+        if (g_touch_log) fprintf(stderr, "[touch] stick on\n");
+        g_shown_seq = ~0u;                               /* draw it now */
+    }
+    if (g_t_state == 3 && !g_t_moved && g_t_fingers >= 2 && now - g_t2_since >= TOUCH_STICK_MS
+        && (!hle_touch_stick_hook || hle_touch_stick_hook())) {
+        g_t_state = 5;                                   /* the fingers' lift ends it, with no right click */
+        radial_open((g_t_x0 + g_t2_x) / 2, (g_t_y0 + g_t2_y) / 2);
+    }
+    if (g_rad_open || g_hk_open) g_shown_seq = ~0u;      /* a still picture is drawn again, with the ring or the list */
+    if (g_t_state != 4) return;
+    g_shown_seq = ~0u;                                   /* a still picture (a menu) is drawn again, with the stick */
+    float px, py;
+    stick_pull(&px, &py);
+    float t = (float)((now - g_stick_phase) % 100) / 100.0f;
+    int want = 0;
+    float ax = SDL_fabs(px), ay = SDL_fabs(py);
+    if (ax > STICK_DEAD && t < ax) want |= px < 0 ? 1 : 4;
+    if (ay > STICK_DEAD && t < ay) want |= py < 0 ? 2 : 8;
+    stick_keys(want);
+}
+/* the stick over the picture, while it is held: a ring and a knob */
+static void fill_circle(int cx, int cy, int r) {
+    for (int y = -r; y <= r; y++) {
+        int x = (int)SDL_sqrt((double)(r * r - y * y));
+        SDL_RenderDrawLine(g_ren, cx - x, cy + y, cx + x, cy + y);
+    }
+}
+static void draw_ring(int cx, int cy, int r, int th) {
+    int steps = r * 6 > 90 ? r * 6 : 90;
+    for (int i = 0; i < steps; i++) {
+        double a = i * 6.2831853 / steps;
+        SDL_Rect d = { cx + (int)(r * SDL_cos(a)) - th / 2, cy + (int)(r * SDL_sin(a)) - th / 2, th, th };
+        SDL_RenderFillRect(g_ren, &d);
+    }
+}
+/* Text for the ring and the hot key list: a built-in 5x7 font, upper case,
+ * drawn as squares of px pixels (no font file: a phone's system fonts are not
+ * readable by the app; the same glyphs as the UWP launcher's). */
+static const struct { char c; uint8_t row[7]; } k_bm[] = {
+    {'A',{14,17,17,31,17,17,17}}, {'B',{30,17,17,30,17,17,30}}, {'C',{14,17,16,16,16,17,14}},
+    {'D',{30,17,17,17,17,17,30}}, {'E',{31,16,16,30,16,16,31}}, {'F',{31,16,16,30,16,16,16}},
+    {'G',{14,17,16,23,17,17,15}}, {'H',{17,17,17,31,17,17,17}}, {'I',{14,4,4,4,4,4,14}},
+    {'J',{7,2,2,2,2,18,12}},      {'K',{17,18,20,24,20,18,17}}, {'L',{16,16,16,16,16,16,31}},
+    {'M',{17,27,21,21,17,17,17}}, {'N',{17,17,25,21,19,17,17}}, {'O',{14,17,17,17,17,17,14}},
+    {'P',{30,17,17,30,16,16,16}}, {'Q',{14,17,17,17,21,18,13}}, {'R',{30,17,17,30,20,18,17}},
+    {'S',{15,16,16,14,1,1,30}},   {'T',{31,4,4,4,4,4,4}},       {'U',{17,17,17,17,17,17,14}},
+    {'V',{17,17,17,17,17,10,4}},  {'W',{17,17,17,21,21,21,10}}, {'X',{17,17,10,4,10,17,17}},
+    {'Y',{17,17,10,4,4,4,4}},     {'Z',{31,1,2,4,8,16,31}},
+    {'0',{14,17,19,21,25,17,14}}, {'1',{4,12,4,4,4,4,14}},      {'2',{14,17,1,2,4,8,31}},
+    {'3',{31,2,4,2,1,17,14}},     {'4',{2,6,10,18,31,2,2}},     {'5',{31,16,30,1,1,17,14}},
+    {'6',{6,8,16,30,17,17,14}},   {'7',{31,1,2,4,8,8,8}},       {'8',{14,17,17,14,17,17,14}},
+    {'9',{14,17,17,15,1,2,12}},   {'\'',{4,4,8,0,0,0,0}},      {':',{0,12,12,0,12,12,0}},
+    {'-',{0,0,0,31,0,0,0}},       {'/',{1,1,2,4,8,16,16}},      {'+',{0,4,4,31,4,4,0}},
+    {'(',{2,4,8,8,8,4,2}},        {')',{8,4,2,2,2,4,8}},        {'.',{0,0,0,0,0,12,12}},
+    {',',{0,0,0,0,12,4,8}},       {'?',{14,17,1,2,4,0,4}},
+};
+static int bm_w(int px, const char *s) { int n = s ? (int)strlen(s) : 0; return n ? n * 6 * px - px : 0; }
+/* s from x (its top at y), in the colour set; no wider than maxw (cut at a whole letter) */
+static void bm_text(int x, int y, int px, const char *s, int maxw) {
+    if (!s) return;
+    for (int x0 = x; *s && x + 5 * px <= x0 + maxw; s++, x += 6 * px) {
+        char c = (char)SDL_toupper((unsigned char)*s);
+        for (size_t g = 0; g < sizeof k_bm / sizeof k_bm[0]; g++) {
+            if (k_bm[g].c != c) continue;
+            for (int row = 0; row < 7; row++)
+                for (int col = 0; col < 5; col++)
+                    if (k_bm[g].row[row] >> (4 - col) & 1) {
+                        SDL_Rect d = { x + col * px, y + row * px, px, px };
+                        SDL_RenderFillRect(g_ren, &d);
+                    }
+            break;
+        }
+    }
+}
+/* s centred on cx, words wrapped to wrap pixels, from top; returns the height drawn (or that would be, draw 0) */
+static int bm_wrapped(int cx, int top, int px, const char *s, int wrap, int draw) {
+    if (!s || !*s) return 0;
+    int per = (wrap + px) / (6 * px), lines = 0;         /* letters a line */
+    if (per < 1) per = 1;
+    const char *p = s;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        int n = (int)strlen(p);
+        if (n > per) {                                   /* break at the last space that fits */
+            int k = per;
+            while (k > 0 && p[k] != ' ') k--;
+            n = k > 0 ? k : per;
+        }
+        if (draw) {
+            char line[128];
+            int m = n < (int)sizeof line - 1 ? n : (int)sizeof line - 1;
+            memcpy(line, p, (size_t)m), line[m] = 0;
+            bm_text(cx - bm_w(px, line) / 2, top + lines * 9 * px, px, line, wrap + px);
+        }
+        p += n, lines++;
+    }
+    return lines ? lines * 9 * px - 2 * px : 0;
+}
+/* a command in its circle: its key large (a word, as "Hot Keys", smaller), its name small under it */
+static void radial_label(const char *label, const char *key, int x, int y, int ir) {
+    int wrap = ir * 17 / 10;
+    int kp = ir * 45 / 100 / 7;                          /* the key's letters: near half the circle high */
+    if (key && bm_w(kp, key) > wrap) kp = wrap / (6 * (int)strlen(key));
+    if (kp < 2) kp = 2;
+    int lp = ir * 15 / 100 / 7 > 1 ? ir * 15 / 100 / 7 : 1;
+    int h1 = key && *key ? 7 * kp : 0, h2 = bm_wrapped(x, 0, lp, label, wrap, 0), gap = h2 ? 3 * lp : 0;
+    int top = y - (h1 + gap + h2) / 2;
+    SDL_SetRenderDrawColor(g_ren, 255, 220, 80, 255);
+    if (h1) bm_text(x - bm_w(kp, key) / 2, top, kp, key, wrap + kp);
+    SDL_SetRenderDrawColor(g_ren, 230, 230, 230, 255);
+    bm_wrapped(x, top + h1 + gap, lp, label, wrap, 1);
+}
+static void radial_draw(void) {
+    if (!g_rad_open || !g_ren) return;
+    int cx, cy, r, rr, ir;
+    radial_geom(&cx, &cy, &r, &rr, &ir);
+    int th = r / 30 > 2 ? r / 30 : 2;
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 140);
+    fill_circle(cx, cy, r);
+    SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 200);
+    draw_ring(cx, cy, r, th);
+    for (int i = 0; i < g_rad_n; i++) {
+        int x, y;
+        radial_item_at(i, &x, &y);
+        SDL_SetRenderDrawColor(g_ren, 20, 30, 60, 220);
+        fill_circle(x, y, ir);
+        radial_label(g_rad_items[i].label, g_rad_items[i].key, x, y, ir);
+        if (g_rad_hit == i) SDL_SetRenderDrawColor(g_ren, 255, 220, 80, 240);
+        else SDL_SetRenderDrawColor(g_ren, 90, 160, 255, 220);
+        draw_ring(x, y, ir, th);
+    }
+    SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 160);   /* the middle: an x (a tap outside the buttons closes) */
+    {
+        int c = r / 8;
+        for (int t = -th / 2; t <= th / 2; t++) {
+            SDL_RenderDrawLine(g_ren, cx - c + t, cy - c, cx + c + t, cy + c);
+            SDL_RenderDrawLine(g_ren, cx + c + t, cy - c, cx - c + t, cy + c);
+        }
+    }
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
+}
+/* a cell of the list: s from x, centred on y, cut at maxw */
+static void hk_text(int px, const char *s, int x, int y, int maxw, SDL_Color c) {
+    if (!s || !*s) return;
+    SDL_SetRenderDrawColor(g_ren, c.r, c.g, c.b, c.a);
+    bm_text(x, y - 7 * px / 2, px, s, maxw);
+}
+static void hk_draw(void) {
+    if (!g_hk_open || !g_ren) return;
+    SDL_Rect pa, cl; int th, rh;
+    hk_geom(&pa, &cl, &th, &rh);
+    int px = rh * 36 / 100 / 7 > 2 ? rh * 36 / 100 / 7 : 2, spx = px * 2 / 3 > 1 ? px * 2 / 3 : 1;   /* letters: key and command; description */
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(g_ren, 8, 12, 24, 230);
+    SDL_RenderFillRect(g_ren, &pa);
+    SDL_Rect bar = { pa.x, pa.y, pa.w, th };
+    SDL_SetRenderDrawColor(g_ren, 30, 60, 120, 240);
+    SDL_RenderFillRect(g_ren, &bar);
+    SDL_SetRenderDrawColor(g_ren, 90, 160, 255, 220);
+    SDL_RenderDrawRect(g_ren, &pa);
+    int pad = th / 4;
+    hk_text(px, "Hot Keys", pa.x + pad, pa.y + th / 2, pa.w / 2, (SDL_Color){ 255, 255, 255, 255 });
+    SDL_SetRenderDrawColor(g_ren, 200, 60, 60, 240);     /* the close box: a red square with an x */
+    SDL_RenderFillRect(g_ren, &cl);
+    SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
+    {
+        int m = cl.w / 4, t = cl.w / 12 > 1 ? cl.w / 12 : 1;
+        for (int k = -t; k <= t; k++) {
+            SDL_RenderDrawLine(g_ren, cl.x + m + k, cl.y + m, cl.x + cl.w - m + k, cl.y + cl.h - m);
+            SDL_RenderDrawLine(g_ren, cl.x + cl.w - m + k, cl.y + m, cl.x + m + k, cl.y + cl.h - m);
+        }
+    }
+    SDL_Rect body = { pa.x, pa.y + th, pa.w, pa.h - th };
+    SDL_RenderSetClipRect(g_ren, &body);
+    int ck = pa.w * 18 / 100, cc = pa.w * 26 / 100;      /* columns: key, command, description */
+    int first = (int)(g_hk_scroll / rh);
+    for (int i = first; i < g_hk_n; i++) {
+        int y = body.y + i * rh - (int)g_hk_scroll;
+        if (y >= body.y + body.h) break;
+        const hle_hotkey_item_t *it = &g_hk_items[i];
+        if (i == g_hk_row && it->enabled) {
+            SDL_Rect hl = { pa.x + 1, y, pa.w - 2, rh };
+            SDL_SetRenderDrawColor(g_ren, 60, 110, 200, 200);
+            SDL_RenderFillRect(g_ren, &hl);
+        }
+        SDL_SetRenderDrawColor(g_ren, 60, 80, 120, 160);
+        SDL_RenderDrawLine(g_ren, pa.x + pad, y + rh - 1, pa.x + pa.w - pad, y + rh - 1);
+        SDL_Color kc = it->enabled ? (SDL_Color){ 255, 220, 80, 255 } : (SDL_Color){ 150, 150, 150, 255 };
+        SDL_Color tc = it->enabled ? (SDL_Color){ 255, 255, 255, 255 } : (SDL_Color){ 150, 150, 150, 255 };
+        hk_text(px, it->key, pa.x + pad, y + rh / 2, ck - pad, kc);
+        hk_text(px, it->command, pa.x + ck, y + rh / 2, cc - pad, tc);
+        hk_text(spx, it->desc, pa.x + ck + cc, y + rh / 2, pa.w - ck - cc - pad, (SDL_Color){ 190, 190, 200, 255 });
+    }
+    SDL_RenderSetClipRect(g_ren, NULL);
+    float m = hk_max_scroll();                           /* the scroll bar */
+    if (m > 0) {
+        int bh = body.h * body.h / (body.h + (int)m), by = body.y + (int)((body.h - bh) * (g_hk_scroll / m));
+        SDL_Rect sb = { pa.x + pa.w - pad / 2 - 2, by, pad / 2 > 3 ? pad / 2 : 3, bh };
+        SDL_SetRenderDrawColor(g_ren, 150, 180, 230, 160);
+        SDL_RenderFillRect(g_ren, &sb);
+    }
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
+}
+static void touch_draw(void) {
+    hk_draw();
+    radial_draw();
+    if (g_t_state != 4 || !g_ren) return;
+    int w, h;
+    SDL_GetRendererOutputSize(g_ren, &w, &h);
+    float px, py;
+    stick_pull(&px, &py);
+    int cx = (int)(g_t_x0 * w), cy = (int)(g_t_y0 * h), r = (int)(STICK_RADIUS * h), kr = r / 3;
+    int kx = cx + (int)(px * r), ky = cy + (int)(py * r);
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 110);
+    for (int y = -r; y <= r; y++) {                      /* the base, filled */
+        int x = (int)SDL_sqrt((double)(r * r - y * y));
+        SDL_RenderDrawLine(g_ren, cx - x, cy + y, cx + x, cy + y);
+    }
+    SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 200);
+    int th = r / 25 > 2 ? r / 25 : 2;                    /* its ring, a few pixels thick */
+    for (int i = 0; i < 720; i++) {
+        double a = i * 3.14159265 / 360.0;
+        SDL_Rect d = { cx + (int)(r * SDL_cos(a)) - th / 2, cy + (int)(r * SDL_sin(a)) - th / 2, th, th };
+        SDL_RenderFillRect(g_ren, &d);
+    }
+    SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 170);
+    for (int y = -kr; y <= kr; y++) {                    /* the knob */
+        int x = (int)SDL_sqrt((double)(kr * kr - y * y));
+        SDL_RenderDrawLine(g_ren, kx - x, ky + y, kx + x, ky + y);
+    }
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
+}
+
 void hle_screen_pump(void) {
 #ifdef __EMSCRIPTEN__
     /* the browser's main thread queues this thread's input callbacks */
@@ -844,6 +1423,9 @@ void hle_screen_pump(void) {
 #endif
         if (g_menu_depth && menu_event(&e)) continue;
         if (g_menu_eat_up && e.type == SDL_MOUSEBUTTONUP) { g_menu_eat_up = 0; continue; }
+        if (e.type == SDL_FINGERDOWN || e.type == SDL_FINGERUP || e.type == SDL_FINGERMOTION) { touch_event(&e); continue; }
+        if ((e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) && e.button.which == SDL_TOUCH_MOUSEID) continue;
+        if (e.type == SDL_MOUSEMOTION && e.motion.which == SDL_TOUCH_MOUSEID) continue;
         switch (e.type) {
         case SDL_QUIT: {
             uint32_t h = hle_first_hwnd();
@@ -922,6 +1504,7 @@ void hle_screen_pump(void) {
         default: break;
         }
     }
+    touch_poll();
     if (hle_screen_poll_hook) hle_screen_poll_hook();
     present(0);
     confine_update();
@@ -948,13 +1531,19 @@ static void primary_changed(void) {
     if (!g_ren || !pthread_equal(pthread_self(), g_video_thread)) return;
     uint32_t now = hle_ticks_ms();
     int flip = hle_dd_flipping();
-    if (!flip && now - g_last_present < 15) return;
-    if (now - last_events >= 100) SDL_PumpEvents(), last_events = now;
+    if (!flip && now - g_last_present < present_ms()) return;
+    if (now - last_events >= 100) {
+        PT_START();
+        SDL_PumpEvents(), last_events = now;
+        PT(5);
+        hle_present_n[5]++;
+    }
     present(flip);
 }
 
 int hle_screen_open(const char *title, int fullscreen, int headless) {
     g_headless = headless, g_fullscreen = fullscreen;
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");      /* touch is ours (touch_event): two fingers, a right click */
     hle_set_pump_hook(hle_screen_pump);
     hle_input_relative_hook = want_relative;
     hle_gdi_window_hook = present_gdi;                   /* a GDI game's blit shows, pumping or not (a loading bar) */
@@ -982,7 +1571,13 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
      * framebuffer, which SDL hands to the canvas from the page's thread. */
     g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
 #else
-    g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_PRESENTVSYNC);
+    /* HLE_VSYNC=0: present without waiting for the display. The present runs
+     * on the game's thread, so a vsync wait there is time the game logic
+     * does not run (on a slow device it was ~40% of the main thread). */
+    {
+        const char *v = SDL_getenv("HLE_VSYNC");
+        g_ren = SDL_CreateRenderer(g_win, -1, v && !strcmp(v, "0") ? SDL_RENDERER_ACCELERATED : SDL_RENDERER_PRESENTVSYNC);
+    }
     if (!g_ren) g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
 #endif
     if (!g_ren) { fprintf(stderr, "[screen] renderer: %s\n", SDL_GetError()); return -1; }
@@ -993,6 +1588,9 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
     SDL_GetRendererInfo(g_ren, &ri);
     g_video_thread = pthread_self();
     hle_dd_primary_hook = primary_changed;
+    if (SDL_getenv("RA2_D3D_FL_GOT"))                        /* the patched SDL D3D11 (tools/sdl_d3d11_fast.py) */
+        fprintf(stderr, "[screen] D3D11 feature level %s%s%s\n", SDL_getenv("RA2_D3D_FL_GOT"),
+                SDL_getenv("RA2_D3D_FL") ? ", capped at " : "", SDL_getenv("RA2_D3D_FL") ? SDL_getenv("RA2_D3D_FL") : "");
     fprintf(stderr, "[screen] %s, renderer %s, scaling %s (F12), fullscreen F11%s\n", SDL_GetCurrentVideoDriver(), ri.name,
             k_modes[g_mode], g_confine ? ", mouse held in the picture (" RELEASE_KEYS " lets go)" : "");
     return 0;

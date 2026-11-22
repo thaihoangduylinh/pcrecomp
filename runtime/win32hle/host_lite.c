@@ -108,9 +108,75 @@ static pthread_mutex_t g_hand_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_hand_cv = PTHREAD_COND_INITIALIZER;
 static volatile int    g_hand_watchers;
 #endif
+/* --profile: where the main thread waits (hle_shim_timing on). [0] blocked
+ * in the wait itself (Sleep, an event), [1] taking the machine back after it,
+ * [2] handing the machine over at an import (hle_yield), [3] other guest
+ * threads holding the machine (any thread but the main one). */
+uint64_t hle_wait_ns[6];
+uint32_t hle_wait_n[6];      /* [4] of [2]: until another thread took the machine; [5]: taking it back */
+/* Spinning, not sleeping, for the machine: a thread asking for it, or one
+ * that handed it over and waits for the taker, first spins up to this many
+ * microseconds (0: never, as before). A short turn (a timer callback, ~50 us)
+ * then costs no wake-up of the thread that waits for it to end. */
+int hle_take_spin_us;
+/* A thread keeps the machine at least this long (us) before an import or a
+ * loop back-edge hands it to a waiter (0: hand it over at once, as before).
+ * Two threads both waiting otherwise trade it at every import: RA2's audio
+ * thread, ~20 DirectSound calls a pass, cost ~20 hand-overs a pass. A real
+ * wait (Sleep, an event) still gives it up at once. */
+int hle_min_turn_us;
+static __thread uint64_t t_turn_t0;
+#if defined(__arm__) || defined(_M_ARM) || defined(__aarch64__)
+#define CPU_RELAX() __asm__ __volatile__("yield")
+#elif defined(__i386__) || defined(__x86_64__)
+#define CPU_RELAX() __asm__ __volatile__("pause")
+#else
+#define CPU_RELAX() ((void)0)
+#endif
+static __thread int t_is_main;
+static __thread uint64_t t_held_t0;
+/* Who those other threads are (--profile): per (the guest function a thread
+ * first entered, the import it gave the machine up in), the turns and time. */
+static __thread uint32_t t_entry_va;
+#define HOLDERS 64
+static struct { uint32_t entry; const char *why; uint32_t n; uint64_t ns; } g_holders[HOLDERS];
+static inline void held_start(void) { if (hle_shim_timing && !t_is_main) t_held_t0 = hle_ticks(); }
+static inline void held_stop(const char *why) {
+    if (hle_shim_timing && !t_is_main && t_held_t0) {
+        uint64_t d = hle_ticks_ns(hle_ticks() - t_held_t0);
+        hle_wait_ns[3] += d; hle_wait_n[3]++; t_held_t0 = 0;
+        for (int i = 0; i < HOLDERS; i++)
+            if (!g_holders[i].n || (g_holders[i].entry == t_entry_va && g_holders[i].why == why)) {
+                g_holders[i].entry = t_entry_va, g_holders[i].why = why, g_holders[i].n++, g_holders[i].ns += d;
+                break;
+            }
+    }
+}
+void hle_holders_reset(void) { memset(g_holders, 0, sizeof g_holders); }
+void hle_holders_dump(double wall) {
+    for (int k = 0; k < 12; k++) {
+        int b = -1;
+        for (int i = 0; i < HOLDERS; i++) if (g_holders[i].n && (b < 0 || g_holders[i].ns > g_holders[b].ns)) b = i;
+        if (b < 0) break;
+        fprintf(stderr, "[profile] holder sub_%08X gives up in %-24s %5.2f%%  (%u turns, %.1f us each)\n", g_holders[b].entry,
+                g_holders[b].why ? g_holders[b].why : "?", 100.0 * (double)g_holders[b].ns / 1e9 / wall, g_holders[b].n,
+                (double)g_holders[b].ns / 1e3 / g_holders[b].n);
+        g_holders[b].n = 0;
+    }
+}
+static int take_spin(void) {
+    int us = hle_take_spin_us;
+    if (us <= 0) return 0;
+    uint64_t t0 = hle_mono_ns(), lim = (uint64_t)us * 1000u;
+    for (unsigned n = 0;; n++) {
+        if (pthread_mutex_trylock(&g_mach) == 0) return 1;
+        CPU_RELAX();
+        if ((n & 63) == 63 && hle_mono_ns() - t0 > lim) return 0;
+    }
+}
 static void mach_take(void) {
     __sync_fetch_and_add(&g_waiters, 1);
-    pthread_mutex_lock(&g_mach);
+    if (!take_spin()) pthread_mutex_lock(&g_mach);
     __sync_fetch_and_sub(&g_waiters, 1);
     g_owner_gen++;
     hle_dbg_takes++;
@@ -122,6 +188,8 @@ static void mach_take(void) {
         pthread_mutex_unlock(&g_hand_mx);
     }
 #endif
+    held_start();
+    if (hle_min_turn_us > 0) t_turn_t0 = hle_mono_ns();
 }
 /* Until another thread has taken the machine since gen, nobody waits for it,
  * or the turn has been long enough. */
@@ -130,6 +198,14 @@ static void hand_wait(unsigned gen) {
     for (int spins = 0; g_waiters && g_owner_gen == gen && spins < HLE_SPINS; spins++) HLE_SPIN();
 #else
     if (!g_waiters || g_owner_gen != gen) return;
+    if (hle_take_spin_us > 0) {
+        uint64_t t0 = hle_mono_ns(), lim = (uint64_t)hle_take_spin_us * 1000u;
+        for (unsigned n = 0; g_waiters && g_owner_gen == gen; n++) {
+            CPU_RELAX();
+            if ((n & 63) == 63 && hle_mono_ns() - t0 > lim) break;
+        }
+        if (!g_waiters || g_owner_gen != gen) return;
+    }
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_nsec += 2000000;
@@ -202,6 +278,7 @@ void mach_enter(void) {
 void mach_leave(void) {
     if (--g_ms.depth == 0) {
         regs_save(&g_ms.r);
+        held_stop("(left the guest)");
         pthread_mutex_unlock(&g_mach);
     }
 }
@@ -210,10 +287,13 @@ void mach_leave(void) {
  * section). The registers go with it; nothing between begin and end may touch
  * the register file or guest-shared host state. */
 static __thread unsigned g_block_gen;
+static __thread uint64_t t_block_t0;
 void hle_block_begin(void) {
     if (!g_ms.depth) return;
     regs_save(&g_ms.r);
     g_block_gen = g_owner_gen;
+    held_stop(g_cur_import);
+    if (hle_shim_timing && t_is_main) t_block_t0 = hle_ticks();
     pthread_mutex_unlock(&g_mach);
 }
 /* The mutex is not fair: a thread that gives the machine up for a moment
@@ -223,8 +303,12 @@ void hle_block_begin(void) {
  * first lets a waiter have its turn. */
 void hle_block_end(void) {
     if (!g_ms.depth) return;
+    uint64_t t1 = 0;
+    int timed = hle_shim_timing && t_is_main && t_block_t0;
+    if (timed) { t1 = hle_ticks(); hle_wait_ns[0] += hle_ticks_ns(t1 - t_block_t0); hle_wait_n[0]++; }
     hand_wait(g_block_gen);
     mach_take();
+    if (timed) { hle_wait_ns[1] += hle_ticks_ns(hle_ticks() - t1); hle_wait_n[1]++; t_block_t0 = 0; }
     regs_load(&g_ms.r);
 }
 
@@ -233,12 +317,22 @@ void hle_block_end(void) {
 volatile unsigned hle_dbg_yields, hle_dbg_handed, hle_dbg_timeouts, hle_dbg_takes;
 void hle_yield(void) {
     if (!g_waiters || !g_ms.depth) return;
+    if (hle_min_turn_us > 0 && hle_mono_ns() - t_turn_t0 < (uint64_t)hle_min_turn_us * 1000u) return;
     unsigned gen = g_owner_gen;
     hle_dbg_yields++;
+    uint64_t t0 = hle_shim_timing && t_is_main ? hle_ticks() : 0;
     hle_block_begin();
+    t_block_t0 = 0;                           /* counted below, not as a wait */
     hand_wait(gen);
+    uint64_t t1 = t0 ? hle_ticks() : 0;
     if (g_owner_gen != gen) hle_dbg_handed++; else if (g_waiters) hle_dbg_timeouts++;
     hle_block_end();
+    if (t0) {
+        uint64_t t2 = hle_ticks();
+        hle_wait_ns[2] += hle_ticks_ns(t2 - t0); hle_wait_n[2]++;
+        hle_wait_ns[4] += hle_ticks_ns(t1 - t0); hle_wait_n[4]++;
+        hle_wait_ns[5] += hle_ticks_ns(t2 - t1); hle_wait_n[5]++;
+    }
 }
 
 /* ------------------------------------------------------------- dispatch
@@ -299,8 +393,8 @@ static volatile uint32_t g_pending_shim;
  * until hle_shim_timing is set: the clock (hle_ticks) is read twice a call. */
 int hle_shim_timing;
 uint64_t hle_shim_ns_main[MAX_SHIMS];
+uint32_t hle_shim_calls_main[MAX_SHIMS];
 volatile int hle_in_shim_main = -1;
-static __thread int t_is_main;
 void hle_mark_main_thread(void) { t_is_main = 1; }
 int hle_shim_total(void) { return g_shim_n; }
 const char *hle_shim_name_at(int i) { return i >= 0 && i < g_shim_n ? g_shim[i].name : NULL; }
@@ -354,6 +448,7 @@ static void shim_entry(void) {
     uint64_t t0 = hle_ticks();
     g_shim[i].fn();
     hle_shim_ns_main[i] += hle_ticks_ns(hle_ticks() - t0);
+    hle_shim_calls_main[i]++;
     hle_in_shim_main = outer;
 }
 /* recomp_types.h's recomp_is_import: imports first, never cached */
@@ -399,6 +494,7 @@ uint32_t hle_resolve_or_stub(const char *name) {
 
 /* ------------------------------------------------------- native -> guest */
 uint32_t hle_call_guest(uint32_t va, int nargs, const uint32_t *args) {
+    if (!t_entry_va) t_entry_va = va;
     mach_enter();
     recomp_func_t f = recomp_lookup(va);       /* under the machine: shim_entry's index is shared */
     if (!f) f = recomp_lookup_import(va);

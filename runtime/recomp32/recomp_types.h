@@ -25,8 +25,18 @@
 #include <stdio.h>
 #include <math.h>
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
 #include <intrin.h>
+#elif defined(_MSC_VER)
+/* Windows on ARM (a UWP build for Windows 10 Mobile): no rdtsc, and no
+ * clock_gettime in the C runtime; C11's timespec_get is there. */
+#include <intrin.h>
+#include <time.h>
+static inline uint64_t __rdtsc(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 #elif defined(__i386__) || defined(__x86_64__)
 #include <x86intrin.h>   /* __rdtsc, as <intrin.h> gives MSVC */
 #else
@@ -287,12 +297,32 @@ void     recomp_set_if(uint32_t on);   /* popf */
 void     recomp_hlt(void);
 void     recomp_set_seg(int sreg, uint32_t selector);
 
+#if defined(RECOMP_MEM_PLAIN) && (defined(__GNUC__) || defined(__clang__))
+/* RECOMP_MEM_PLAIN (opt-in, GCC/Clang): guest memory as ordinary memory the
+ * compiler may keep in registers between accesses, not volatile. Each access
+ * is still byte-aligned (no LDRD/LDM on a misaligned guest address, ARM) and
+ * may alias anything. It is safe only where one thread at a time runs lifted
+ * code and every wait on another thread goes through a call (an import), as
+ * under win32hle's machine lock: a call makes the compiler read memory again. */
+typedef uint16_t __attribute__((aligned(1), may_alias)) recomp_u16u;
+typedef uint32_t __attribute__((aligned(1), may_alias)) recomp_u32u;
+typedef uint64_t __attribute__((aligned(1), may_alias)) recomp_u64u;
+typedef float    __attribute__((aligned(1), may_alias)) recomp_f32u;
+typedef double   __attribute__((aligned(1), may_alias)) recomp_f64u;
+#define MEM8(addr)   (*(uint8_t     *)ADDR(addr))
+#define MEM16(addr)  (*(recomp_u16u *)ADDR(addr))
+#define MEM32(addr)  (*(recomp_u32u *)ADDR(addr))
+#define MEM64(addr)  (*(recomp_u64u *)ADDR(addr))
+#define MEMF(addr)   (*(recomp_f32u *)ADDR(addr))
+#define MEMD(addr)   (*(recomp_f64u *)ADDR(addr))
+#else
 #define MEM8(addr)   (*(volatile uint8_t  *)ADDR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)ADDR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)ADDR(addr))
 #define MEM64(addr)  (*(volatile uint64_t *)ADDR(addr))
 #define MEMF(addr)   (*(volatile float    *)ADDR(addr))
 #define MEMD(addr)   (*(volatile double   *)ADDR(addr))
+#endif
 
 /* Set 32-bit values in memory (for rep stosd) */
 static inline void MEMSET32(void* dst, uint32_t val, uint32_t count) {
@@ -1227,7 +1257,7 @@ RECOMP_WEAK uint32_t g_cpuid_edx_ext RECOMP_WEAK_INIT(0xFFFFFFFFu);
 RECOMP_WEAK uint32_t g_cpuid_signature RECOMP_WEAK_INIT(0);
 
 static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_val, uint32_t edx_val) {
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))   /* not Windows on ARM: no cpuid there */
     int info[4];
     __cpuidex(info, eax_val, ecx_val);
     g_eax = info[0]; g_ebx = info[1]; g_ecx = info[2]; g_edx = info[3];
@@ -1377,12 +1407,17 @@ static inline recomp_func_t recomp_resolve(uint32_t va) {
 /* Direct call to a known recompiled function. The _SS forms are for a
  * function LIFT32_W9X sees load ss (generate.py): the dummy return goes on the
  * stack ss names, not at flat esp (a 16-bit esp there is a low linear address). */
-#define RECOMP_CALL(func) RECOMP_CALL_P(func, PUSH32)
-#define RECOMP_CALL_SS(func) RECOMP_CALL_P(func, PUSH32_SS)
-#define RECOMP_CALL_P(func, PUSHM) do { \
+#define RECOMP_CALL(func) RECOMP_CALL_P(func, PUSH32, RECOMP_FLAGS_OUT())
+#define RECOMP_CALL_SS(func) RECOMP_CALL_P(func, PUSH32_SS, RECOMP_FLAGS_OUT())
+/* _NF: the callee does not read the caller's flags (the lifter's flag-flow
+ * analysis, tools/lift/flagflow.py), so they are not stored for it: the
+ * store kept every flag computation before the call alive. */
+#define RECOMP_CALL_NF(func) RECOMP_CALL_P(func, PUSH32, (void)0)
+#define RECOMP_CALL_NF_SS(func) RECOMP_CALL_P(func, PUSH32_SS, (void)0)
+#define RECOMP_CALL_P(func, PUSHM, FLAGS) do { \
     uint32_t _caller = g_cur_func; \
     PUSHM(esp, RECOMP_RETADDR); /* dummy return address */ \
-    RECOMP_FLAGS_OUT(); \
+    FLAGS; \
     RECOMP_REGS_OUT(); \
     func(); \
     RECOMP_REGS_IN(); \
@@ -1409,16 +1444,18 @@ RECOMP_WEAK void (*recomp_trap_hook)(uint32_t code, uint32_t va);
     RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); recomp_trap_hook(code_, va_); RECOMP_REGS_IN(); } } while (0)
 
 /* Indirect call through dispatch */
-#define RECOMP_ICALL(target_va) RECOMP_ICALL_P(target_va, PUSH32)
-#define RECOMP_ICALL_SS(target_va) RECOMP_ICALL_P(target_va, PUSH32_SS)
-#define RECOMP_ICALL_P(target_va, PUSHM) do { \
+#define RECOMP_ICALL(target_va) RECOMP_ICALL_P(target_va, PUSH32, RECOMP_FLAGS_OUT())
+#define RECOMP_ICALL_SS(target_va) RECOMP_ICALL_P(target_va, PUSH32_SS, RECOMP_FLAGS_OUT())
+#define RECOMP_ICALL_NF(target_va) RECOMP_ICALL_P(target_va, PUSH32, (void)0)       /* see RECOMP_CALL_NF */
+#define RECOMP_ICALL_NF_SS(target_va) RECOMP_ICALL_P(target_va, PUSH32_SS, (void)0)
+#define RECOMP_ICALL_P(target_va, PUSHM, FLAGS) do { \
     uint32_t _va = (uint32_t)(target_va); \
     RECOMP_ICALL_TRACE(_va); \
     recomp_func_t _fn = RECOMP_RESOLVE_SITE(_va); \
     if (_fn) { \
         uint32_t _caller = g_cur_func; \
         PUSHM(esp, RECOMP_RETADDR); \
-        RECOMP_FLAGS_OUT(); \
+        FLAGS; \
         RECOMP_REGS_OUT(); \
         _fn(); \
         RECOMP_REGS_IN(); \

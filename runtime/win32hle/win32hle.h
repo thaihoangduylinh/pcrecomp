@@ -43,17 +43,30 @@ typedef uint32_t win_handle;   /* HANDLE/HWND/HDC/HMODULE/HBITMAP... */
  * hle_va convert either way; guest NULL is host NULL. Anything the guest is
  * handed an address of must live in that block: allocate it with hle_alloc,
  * hle_vm_reserve or hle_scratch, never malloc or the host's stack. */
-#if defined(RECOMP_FLAT_MEMORY) || UINTPTR_MAX == 0xFFFFFFFFu
-#define HLE_FLAT 1                                /* any 32-bit host: g_mem_base is 0 */
+/* A 32-bit host is flat unless it asks for HLE_BASED (and so does not define
+ * RECOMP_FLAT_MEMORY): then, as on a 64-bit host, the guest's memory is one
+ * block at g_mem_base -- for hosts that cannot have the guest's image range
+ * at its own addresses (a UWP app container forces ASLR on the exe and puts
+ * its heaps and stack at 0x00400000). A 32-bit host has no room for 4 GB:
+ * the block is the first hle_span bytes of the guest's space (guest_mem.c),
+ * and a VA is an offset below that. */
+#if defined(RECOMP_FLAT_MEMORY) || (UINTPTR_MAX == 0xFFFFFFFFu && !defined(HLE_BASED))
+#define HLE_FLAT 1                                /* g_mem_base is 0 */
 static inline void    *hle_ptr(uint32_t va)   { return (void *)(uintptr_t)va; }
 static inline uint32_t hle_va(const void *p)  { return (uint32_t)(uintptr_t)p; }
 #else
+#if UINTPTR_MAX == 0xFFFFFFFFu
+extern uint32_t hle_span;                      /* bytes of guest space reserved (32-bit host) */
+#define HLE_OFF_BAD(off) ((uint32_t)(off) >= hle_span)
+#else
+#define HLE_OFF_BAD(off) ((uint64_t)(off) >> 32)
+#endif
 uint32_t hle_va_bad(const void *p);            /* fatal: a host pointer handed to the guest */
 static inline void *hle_ptr(uint32_t va) { return va ? (void *)ADDR(va) : NULL; }
 static inline uint32_t hle_va(const void *p) {
     if (!p) return 0;
     uintptr_t off = (uintptr_t)p - (uintptr_t)g_mem_base;
-    return (uint64_t)off >> 32 ? hle_va_bad(p) : (uint32_t)off;
+    return HLE_OFF_BAD(off) ? hle_va_bad(p) : (uint32_t)off;
 }
 #endif
 
@@ -134,7 +147,26 @@ extern uint32_t hle_vm_any_hi;
  * hle_in_shim_main is the import that thread runs now, -1 in guest code. */
 extern int hle_shim_timing;
 extern uint64_t hle_shim_ns_main[];
+extern uint32_t hle_shim_calls_main[];   /* calls, counted with hle_shim_ns_main */
+extern uint64_t hle_dd_hook_ns;          /* time in hle_dd_primary_hook, while hle_shim_timing */
+extern uint64_t hle_present_ns[8];       /* screen.c: the present's parts (--profile) */
+extern uint32_t hle_present_n[8];
+typedef struct { const char *label, *key; } hle_ring_item_t;   /* a ring menu command: its text, and its key's (a smaller line) */
+extern const hle_ring_item_t *(*hle_radial_items_hook)(int *n);  /* screen.c ring menu (two fingers held): the commands, *n of them */
+extern void (*hle_radial_pick_hook)(int i);
+/* screen.c: a list of hot keys over the picture (touch: drag scrolls, a tap on
+ * an enabled row calls pick(i) and closes it; the close box or outside closes) */
+typedef struct { const char *key, *command, *desc; int enabled; } hle_hotkey_item_t;
+void hle_screen_hotkeys(const hle_hotkey_item_t *items, int n, void (*pick)(int i));                       /* ... and running the one tapped */
+extern int (*hle_touch_stick_hook)(void);   /* screen.c: whether a held finger may bring up the camera stick */
 extern volatile int hle_in_shim_main;
+extern uint64_t hle_wait_ns[6];          /* --profile, main thread: in waits, retaking the machine, yielding it; [3] other threads holding it */
+extern uint32_t hle_wait_n[6];
+void hle_holders_reset(void);              /* --profile: the other threads' turns, by entry and the import they gave up in */
+void hle_holders_dump(double wall);
+extern int hle_take_spin_us;
+extern int hle_min_turn_us;               /* keep the machine this long before handing it over at an import (0: off) */              /* spin this long for the machine before sleeping (0: off) */
+extern volatile unsigned hle_mmt_fired;
 int hle_shim_total(void);
 const char *hle_shim_name_at(int i);
 void hle_mark_main_thread(void);
